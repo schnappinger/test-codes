@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('node:path');
+const Vinyl = require('vinyl');
 
 const DEFAULT_ORDER = 9999;
 const DEFAULT_NAV_FILE = 'generated-nav.adoc';
@@ -11,43 +12,234 @@ module.exports.register = function register ({ config = {} } = {}) {
   const maxLevels = normalizeMaxLevels(config.max_levels || config.maxLevels || DEFAULT_MAX_LEVELS);
   const includeComponents = toMatcherConfig(config.components || config.enabled_components || config.enabledComponents);
 
-  this.on('contentAggregated', ({ contentCatalog }) => {
-    const pages = contentCatalog.getPages()
-      .filter((page) => isPageIncluded(page, includeComponents))
-      .filter((page) => !isNavExcluded(page));
+  this.on('contentAggregated', ({ contentAggregate }) => {
+    if (!Array.isArray(contentAggregate)) {
+      throw new Error('generated navigation extension: contentAggregate is not available. Register the listener for the contentAggregated event.');
+    }
 
-    const groupedPages = groupByComponentVersionModule(pages);
+    for (const componentVersion of contentAggregate) {
+      if (!isComponentVersionIncluded(componentVersion, includeComponents)) continue;
 
-    for (const modulePages of groupedPages.values()) {
-      if (modulePages.length === 0) continue;
+      const pagesByModule = collectPagesByModule(componentVersion, includeComponents);
 
-      const firstPage = modulePages[0];
-      const tree = buildTree(modulePages, maxLevels);
-      const navLines = renderNav(tree, 1, maxLevels);
+      for (const [moduleName, pages] of pagesByModule) {
+        if (pages.length === 0) continue;
 
-      if (navLines.length === 0) continue;
+        const tree = buildTree(pages, maxLevels);
+        const navLines = renderNav(tree, 1, maxLevels);
 
-      contentCatalog.addFile({
-        contents: Buffer.from(`${navLines.join('\n')}\n`, 'utf8'),
-        src: {
-          component: firstPage.src.component,
-          version: firstPage.src.version,
-          module: firstPage.src.module,
-          family: 'nav',
-          relative: navFile,
-        },
-      });
+        if (navLines.length === 0) continue;
+
+        addGeneratedNavFile(componentVersion, moduleName, navFile, navLines, pages[0].file);
+      }
     }
   });
 };
 
-function normalizeMaxLevels (value) {
-  const parsed = Number(value);
+function collectPagesByModule (componentVersion, includeComponents) {
+  const result = new Map();
 
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    return DEFAULT_MAX_LEVELS;
+  for (const file of componentVersion.files || []) {
+    const srcPath = normalizeResourcePath(file.src && file.src.path);
+    const match = srcPath.match(/^modules\/([^/]+)\/pages\/(.+\.adoc)$/);
+
+    if (!match) continue;
+
+    const moduleName = match[1];
+    const relative = match[2];
+
+    if (!isModuleIncluded(componentVersion, moduleName, includeComponents)) continue;
+
+    const contents = getFileContents(file);
+
+    if (isNavExcluded(contents)) continue;
+
+    const page = {
+      file,
+      moduleName,
+      relative,
+      title: getPageTitle(contents, relative),
+      order: getPageOrder(contents),
+    };
+
+    if (!result.has(moduleName)) result.set(moduleName, []);
+    result.get(moduleName).push(page);
   }
 
+  return result;
+}
+
+function addGeneratedNavFile (componentVersion, moduleName, navFile, navLines, templateFile) {
+  const navPath = `modules/${moduleName}/${navFile}`;
+  const origin = templateFile.src && templateFile.src.origin;
+  const cwd = templateFile.cwd || templateFile._cwd || process.cwd();
+  const filePath = origin && origin.worktree ? path.join(origin.worktree, navPath) : path.join(cwd, navPath);
+  const contents = Buffer.from(`${navLines.join('\n')}\n`, 'utf8');
+
+  // Important: Antora's content classifier matches nav entries against file.path,
+  // and file.path must be the virtual content-source-relative path, not an absolute path.
+  const generatedFile = new Vinyl({
+    cwd,
+    base: '.',
+    path: navPath,
+    contents,
+  });
+
+  generatedFile.src = {
+    abspath: filePath,
+    path: navPath,
+    basename: navFile,
+    stem: path.basename(navFile, '.adoc'),
+    extname: '.adoc',
+    origin,
+  };
+
+  removeExistingFile(componentVersion.files, navPath);
+  componentVersion.files.push(generatedFile);
+}
+
+function removeExistingFile (files, srcPath) {
+  const index = files.findIndex((file) => file.src && normalizeResourcePath(file.src.path) === srcPath);
+  if (index >= 0) files.splice(index, 1);
+}
+
+function buildTree (pages, maxLevels) {
+  const root = createDirectoryNode('', DEFAULT_ORDER);
+  for (const page of pages) addPageToTree(root, page, maxLevels);
+  updateDirectoryOrders(root);
+  return root;
+}
+
+function addPageToTree (root, page, maxLevels) {
+  const relativePath = normalizeResourcePath(page.relative);
+  const segments = relativePath.split('/').filter(Boolean);
+  if (segments.length === 0) return;
+
+  const directorySegments = segments.slice(0, -1);
+  const maxDirectoryLevels = Math.max(maxLevels - 1, 0);
+  const visibleDirectorySegments = directorySegments.slice(0, maxDirectoryLevels);
+  const overflowDirectorySegments = directorySegments.slice(maxDirectoryLevels);
+
+  let current = root;
+
+  for (const directorySegment of visibleDirectorySegments) {
+    const key = `dir:${directorySegment}`;
+
+    if (!current.children.has(key)) {
+      current.children.set(key, createDirectoryNode(toDisplayTitle(directorySegment), DEFAULT_ORDER));
+    }
+
+    current = current.children.get(key);
+  }
+
+  const title = overflowDirectorySegments.length > 0
+    ? `${overflowDirectorySegments.map(toDisplayTitle).join(' / ')} / ${page.title}`
+    : page.title;
+
+  current.children.set(`file:${relativePath}`, {
+    type: 'file',
+    title,
+    order: page.order,
+    xref: relativePath,
+  });
+}
+
+function createDirectoryNode (title, order) {
+  return {
+    type: 'directory',
+    title,
+    order,
+    children: new Map(),
+  };
+}
+
+function updateDirectoryOrders (node) {
+  if (node.type !== 'directory') return node.order;
+
+  let lowestOrder = DEFAULT_ORDER;
+
+  for (const child of node.children.values()) {
+    const childOrder = child.type === 'directory' ? updateDirectoryOrders(child) : child.order;
+    lowestOrder = Math.min(lowestOrder, childOrder);
+  }
+
+  node.order = lowestOrder;
+  return node.order;
+}
+
+function renderNav (node, level, maxLevels) {
+  const lines = [];
+  const children = Array.from(node.children.values()).sort(compareEntries);
+
+  for (const child of children) {
+    const safeLevel = Math.min(level, maxLevels);
+    const prefix = '*'.repeat(safeLevel);
+
+    if (child.type === 'directory') {
+      lines.push(`${prefix} ${child.title}`);
+      lines.push(...renderNav(child, safeLevel + 1, maxLevels));
+    } else {
+      lines.push(`${prefix} xref:${child.xref}[${escapeLinkText(child.title)}]`);
+    }
+  }
+
+  return lines;
+}
+
+function getPageTitle (contents, relativePath) {
+  return firstNonBlank([
+    getAttribute(contents, 'page-nav-title'),
+    getAttribute(contents, 'navtitle'),
+    getAttribute(contents, 'page-title'),
+    getDocumentTitle(contents),
+    toDisplayTitle(path.basename(relativePath, '.adoc')),
+  ]);
+}
+
+function getPageOrder (contents) {
+  const parsed = Number(getAttribute(contents, 'nav-order'));
+  return Number.isFinite(parsed) ? parsed : DEFAULT_ORDER;
+}
+
+function isNavExcluded (contents) {
+  const value = getAttribute(contents, 'nav-exclude');
+
+  if (value === undefined || value === null) return false;
+  if (value === false) return false;
+
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '' || normalized === 'true' || normalized === 'yes' || normalized === '1';
+}
+
+function getAttribute (contents, name) {
+  const escapedName = escapeRegExp(name);
+  const match = contents.match(new RegExp(`^:${escapedName}:\\s*(.*?)\\s*$`, 'm'));
+  return match ? match[1] : undefined;
+}
+
+function getDocumentTitle (contents) {
+  const match = contents.match(/^=\s+(.+?)\s*$/m);
+  return match ? match[1].trim() : undefined;
+}
+
+function getFileContents (file) {
+  const contents = file.contents || file._contents;
+
+  if (!contents) return '';
+  if (Buffer.isBuffer(contents)) return contents.toString('utf8');
+
+  return String(contents);
+}
+
+function compareEntries (a, b) {
+  if (a.order !== b.order) return a.order - b.order;
+  if (a.type !== b.type) return a.type === 'file' ? -1 : 1;
+  return a.title.localeCompare(b.title, 'de', { numeric: true, sensitivity: 'base' });
+}
+
+function normalizeMaxLevels (value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_MAX_LEVELS;
   return Math.min(parsed, DEFAULT_MAX_LEVELS);
 }
 
@@ -84,218 +276,25 @@ function toSet (value) {
   return new Set(Array.isArray(value) ? value : [value]);
 }
 
-function isPageIncluded (page, includeComponents) {
+function isComponentVersionIncluded (componentVersion, includeComponents) {
   if (!includeComponents) return true;
 
   return includeComponents.some((entry) => {
-    if (entry.name !== page.src.component) return false;
-    if (entry.versions && !entry.versions.has(page.src.version)) return false;
-    if (entry.modules && !entry.modules.has(page.src.module)) return false;
+    if (entry.name !== componentVersion.name) return false;
+    if (entry.versions && !entry.versions.has(componentVersion.version)) return false;
     return true;
   });
 }
 
-function isNavExcluded (page) {
-  const value = getPageAttribute(page, 'nav-exclude');
+function isModuleIncluded (componentVersion, moduleName, includeComponents) {
+  if (!includeComponents) return true;
 
-  if (value === undefined || value === null) return false;
-  if (value === false) return false;
-
-  const normalized = String(value).trim().toLowerCase();
-
-  return normalized === '' || normalized === 'true' || normalized === 'yes' || normalized === '1';
-}
-
-function groupByComponentVersionModule (pages) {
-  const result = new Map();
-
-  for (const page of pages) {
-    const key = [page.src.component, page.src.version, page.src.module].join('|');
-
-    if (!result.has(key)) {
-      result.set(key, []);
-    }
-
-    result.get(key).push(page);
-  }
-
-  return result;
-}
-
-function buildTree (pages, maxLevels) {
-  const root = createDirectoryNode('', DEFAULT_ORDER);
-
-  for (const page of pages) {
-    addPageToTree(root, page, maxLevels);
-  }
-
-  updateDirectoryOrders(root);
-
-  return root;
-}
-
-function addPageToTree (root, page, maxLevels) {
-  const relativePath = normalizeResourcePath(page.src.relative || page.src.path || page.src.basename);
-  const segments = relativePath.split('/').filter(Boolean);
-
-  if (segments.length === 0) return;
-
-  const fileName = segments[segments.length - 1];
-  const directorySegments = segments.slice(0, -1);
-  const maxDirectoryLevels = Math.max(maxLevels - 1, 0);
-  const visibleDirectorySegments = directorySegments.slice(0, maxDirectoryLevels);
-  const overflowDirectorySegments = directorySegments.slice(maxDirectoryLevels);
-
-  let current = root;
-
-  for (const directorySegment of visibleDirectorySegments) {
-    const key = `dir:${directorySegment}`;
-
-    if (!current.children.has(key)) {
-      current.children.set(key, createDirectoryNode(toDisplayTitle(directorySegment), DEFAULT_ORDER));
-    }
-
-    current = current.children.get(key);
-  }
-
-  const baseTitle = getPageTitle(page, fileName);
-  const title = overflowDirectorySegments.length > 0
-    ? `${overflowDirectorySegments.map(toDisplayTitle).join(' / ')} / ${baseTitle}`
-    : baseTitle;
-
-  current.children.set(`file:${relativePath}`, {
-    type: 'file',
-    title,
-    order: getPageOrder(page),
-    xref: relativePath,
+  return includeComponents.some((entry) => {
+    if (entry.name !== componentVersion.name) return false;
+    if (entry.versions && !entry.versions.has(componentVersion.version)) return false;
+    if (entry.modules && !entry.modules.has(moduleName)) return false;
+    return true;
   });
-}
-
-function createDirectoryNode (title, order) {
-  return {
-    type: 'directory',
-    title,
-    order,
-    children: new Map(),
-  };
-}
-
-function updateDirectoryOrders (node) {
-  if (node.type !== 'directory') return node.order;
-
-  let lowestOrder = DEFAULT_ORDER;
-
-  for (const child of node.children.values()) {
-    const childOrder = child.type === 'directory'
-      ? updateDirectoryOrders(child)
-      : child.order;
-
-    lowestOrder = Math.min(lowestOrder, childOrder);
-  }
-
-  node.order = lowestOrder;
-  return node.order;
-}
-
-function renderNav (node, level, maxLevels) {
-  const lines = [];
-  const children = Array.from(node.children.values()).sort(compareEntries);
-
-  for (const child of children) {
-    const safeLevel = Math.min(level, maxLevels);
-    const prefix = '*'.repeat(safeLevel);
-
-    if (child.type === 'directory') {
-      lines.push(`${prefix} ${child.title}`);
-      lines.push(...renderNav(child, safeLevel + 1, maxLevels));
-    } else {
-      lines.push(`${prefix} xref:${child.xref}[${escapeLinkText(child.title)}]`);
-    }
-  }
-
-  return lines;
-}
-
-function compareEntries (a, b) {
-  if (a.order !== b.order) {
-    return a.order - b.order;
-  }
-
-  if (a.type !== b.type) {
-    return a.type === 'file' ? -1 : 1;
-  }
-
-  return a.title.localeCompare(b.title, 'de', { numeric: true, sensitivity: 'base' });
-}
-
-function getPageTitle (page, fileName) {
-  return firstNonBlank([
-    page.navtitle,
-    page.title,
-    getPageAttribute(page, 'page-title'),
-    getPageAttribute(page, 'page-nav-title'),
-    getPageAttribute(page, 'navtitle'),
-    toDisplayTitle(path.basename(fileName, '.adoc')),
-  ]);
-}
-
-function getPageOrder (page) {
-  const value = getPageAttribute(page, 'nav-order');
-  const parsed = Number(value);
-
-  return Number.isFinite(parsed) ? parsed : DEFAULT_ORDER;
-}
-
-function getPageAttribute (page, name) {
-  const candidates = [
-    page.asciidoc && page.asciidoc.attributes,
-    page.attributes,
-    page.pub && page.pub.attributes,
-  ];
-
-  for (const attributes of candidates) {
-    const value = readAttribute(attributes, name);
-
-    if (value !== undefined) {
-      return value;
-    }
-  }
-
-  const contents = getPageContents(page);
-
-  if (contents) {
-    const escapedName = escapeRegExp(name);
-    const match = contents.match(new RegExp(`^:${escapedName}:\\s*(.*?)\\s*$`, 'm'));
-
-    if (match) {
-      return match[1];
-    }
-  }
-
-  return undefined;
-}
-
-function readAttribute (attributes, name) {
-  if (!attributes) return undefined;
-
-  if (attributes instanceof Map) {
-    return attributes.get(name);
-  }
-
-  if (Object.prototype.hasOwnProperty.call(attributes, name)) {
-    return attributes[name];
-  }
-
-  return undefined;
-}
-
-function getPageContents (page) {
-  const contents = page.contents || page.src && page.src.contents;
-
-  if (!contents) return '';
-  if (Buffer.isBuffer(contents)) return contents.toString('utf8');
-
-  return String(contents);
 }
 
 function firstNonBlank (values) {
@@ -309,7 +308,7 @@ function firstNonBlank (values) {
 }
 
 function normalizeResourcePath (value) {
-  return String(value).split(path.sep).join('/');
+  return String(value || '').split(path.sep).join('/');
 }
 
 function toDisplayTitle (value) {
