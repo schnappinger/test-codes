@@ -1,7 +1,6 @@
 'use strict';
 
 const path = require('node:path');
-const Vinyl = require('vinyl');
 
 const DEFAULT_ORDER = 9999;
 const DEFAULT_NAV_FILE = 'generated-nav.adoc';
@@ -73,25 +72,26 @@ function addGeneratedNavFile (componentVersion, moduleName, navFile, navLines, t
   const navPath = `modules/${moduleName}/${navFile}`;
   const origin = templateFile.src && templateFile.src.origin;
   const cwd = templateFile.cwd || templateFile._cwd || process.cwd();
-  const filePath = origin && origin.worktree ? path.join(origin.worktree, navPath) : path.join(cwd, navPath);
+  const base = templateFile.base || templateFile._base || cwd;
+  const absolutePath = origin && origin.worktree ? path.join(origin.worktree, navPath) : path.join(cwd, navPath);
   const contents = Buffer.from(`${navLines.join('\n')}\n`, 'utf8');
 
-  // Important: Antora's content classifier matches nav entries against file.path,
-  // and file.path must be the virtual content-source-relative path, not an absolute path.
-  const generatedFile = new Vinyl({
+  // Plain virtual file object. No vinyl dependency required.
+  // Important for Antora: file.path must be the content-source-relative path,
+  // because the content classifier matches antora.yml nav entries against file.path.
+  const generatedFile = {
     cwd,
-    base: '.',
+    base,
     path: navPath,
     contents,
-  });
-
-  generatedFile.src = {
-    abspath: filePath,
-    path: navPath,
-    basename: navFile,
-    stem: path.basename(navFile, '.adoc'),
-    extname: '.adoc',
-    origin,
+    src: {
+      abspath: absolutePath,
+      path: navPath,
+      basename: navFile,
+      stem: path.basename(navFile, '.adoc'),
+      extname: '.adoc',
+      origin,
+    },
   };
 
   removeExistingFile(componentVersion.files, navPath);
