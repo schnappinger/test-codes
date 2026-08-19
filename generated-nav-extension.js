@@ -76,9 +76,6 @@ function addGeneratedNavFile (componentVersion, moduleName, navFile, navLines, t
   const absolutePath = origin && origin.worktree ? path.join(origin.worktree, navPath) : path.join(cwd, navPath);
   const contents = Buffer.from(`${navLines.join('\n')}\n`, 'utf8');
 
-  // Plain virtual file object. No vinyl dependency required.
-  // Important for Antora: file.path must be the content-source-relative path,
-  // because the content classifier matches antora.yml nav entries against file.path.
   const generatedFile = {
     cwd,
     base,
@@ -115,7 +112,11 @@ function addPageToTree (root, page, maxLevels) {
   const segments = relativePath.split('/').filter(Boolean);
   if (segments.length === 0) return;
 
+  const fileName = segments[segments.length - 1];
+  const fileStem = path.basename(fileName, '.adoc');
   const directorySegments = segments.slice(0, -1);
+
+  const isFolderIndexPage = directorySegments.length > 0 && fileStem === directorySegments[directorySegments.length - 1];
   const maxDirectoryLevels = Math.max(maxLevels - 1, 0);
   const visibleDirectorySegments = directorySegments.slice(0, maxDirectoryLevels);
   const overflowDirectorySegments = directorySegments.slice(maxDirectoryLevels);
@@ -130,6 +131,18 @@ function addPageToTree (root, page, maxLevels) {
     }
 
     current = current.children.get(key);
+  }
+
+  if (isFolderIndexPage && overflowDirectorySegments.length === 0) {
+    current.page = {
+      type: 'file',
+      title: page.title,
+      order: page.order,
+      xref: relativePath,
+    };
+    current.title = page.title;
+    current.order = Math.min(current.order, page.order);
+    return;
   }
 
   const title = overflowDirectorySegments.length > 0
@@ -149,6 +162,7 @@ function createDirectoryNode (title, order) {
     type: 'directory',
     title,
     order,
+    page: null,
     children: new Map(),
   };
 }
@@ -156,7 +170,7 @@ function createDirectoryNode (title, order) {
 function updateDirectoryOrders (node) {
   if (node.type !== 'directory') return node.order;
 
-  let lowestOrder = DEFAULT_ORDER;
+  let lowestOrder = node.page ? node.page.order : DEFAULT_ORDER;
 
   for (const child of node.children.values()) {
     const childOrder = child.type === 'directory' ? updateDirectoryOrders(child) : child.order;
@@ -176,7 +190,12 @@ function renderNav (node, level, maxLevels) {
     const prefix = '*'.repeat(safeLevel);
 
     if (child.type === 'directory') {
-      lines.push(`${prefix} ${child.title}`);
+      if (child.page) {
+        lines.push(`${prefix} xref:${child.page.xref}[${escapeLinkText(child.page.title)}]`);
+      } else {
+        lines.push(`${prefix} ${child.title}`);
+      }
+
       lines.push(...renderNav(child, safeLevel + 1, maxLevels));
     } else {
       lines.push(`${prefix} xref:${child.xref}[${escapeLinkText(child.title)}]`);
