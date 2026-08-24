@@ -5,199 +5,35 @@ const { spawnSync } = require('node:child_process');
 
 const DEFAULT_ORDER = 9999;
 const DEFAULT_NAV_FILE = 'generated-nav.adoc';
-const DEFAULT_MAX_LEVELS = 5;
+const MAX_LEVELS = 5;
 
 module.exports.register = function register ({ config = {} } = {}) {
-  const navFile = config.nav_file || config.navFile || DEFAULT_NAV_FILE;
-  const maxLevels = normalizeMaxLevels(config.max_levels || config.maxLevels || DEFAULT_MAX_LEVELS);
-  const includeComponents = toMatcherConfig(config.components || config.enabled_components || config.enabledComponents);
+  const navFile = config.navFile || DEFAULT_NAV_FILE;
+  const maxLevels = normalizeMaxLevels(config.maxLevels || MAX_LEVELS);
+  const componentRules = normalizeComponentRules(config.components);
 
   this.on('contentAggregated', ({ contentAggregate }) => {
     if (!Array.isArray(contentAggregate)) {
-      throw new Error('generated navigation extension: contentAggregate is not available at contentAggregated');
+      throw new Error('generated navigation extension: contentAggregate is unavailable');
     }
+
+    const historyCache = new Map();
 
     for (const componentVersion of contentAggregate) {
-      if (!isComponentVersionIncluded(componentVersion, includeComponents)) continue;
+      if (!componentMatches(componentVersion, componentRules)) continue;
 
-      const pagesByModule = collectPagesByModule(componentVersion, includeComponents);
-
-      for (const [moduleName, pages] of pagesByModule) {
-        if (pages.length === 0) continue;
-
-        const tree = buildTree(pages, maxLevels);
-        const navLines = renderNav(tree, 1, maxLevels);
-
-        if (navLines.length > 0) {
-          addGeneratedNavFile(componentVersion, moduleName, navFile, navLines, pages[0].file);
-        }
-      }
+      injectGitAttributes(componentVersion, componentRules, historyCache);
+      generateNavigation(componentVersion, componentRules, navFile, maxLevels);
     }
-  });
-
-  this.on('contentClassified', ({ contentCatalog }) => {
-    if (!contentCatalog) {
-      throw new Error('generated navigation extension: contentCatalog is not available at contentClassified');
-    }
-
-    addGitMetadata(contentCatalog, includeComponents);
   });
 };
 
-function collectPagesByModule (componentVersion, includeComponents) {
-  const result = new Map();
-
+function injectGitAttributes (componentVersion, rules, historyCache) {
   for (const file of componentVersion.files || []) {
-    const srcPath = normalizeResourcePath(file.src && file.src.path);
-    const match = srcPath.match(/^modules\/([^/]+)\/pages\/(.+\.adoc)$/);
-    if (!match) continue;
+    const pageInfo = getPageInfo(file);
+    if (!pageInfo || !moduleMatches(componentVersion, pageInfo.module, rules)) continue;
 
-    const moduleName = match[1];
-    const relative = match[2];
-    if (!isModuleIncluded(componentVersion, moduleName, includeComponents)) continue;
-
-    const contents = getFileContents(file);
-    if (isNavExcluded(contents)) continue;
-
-    const page = {
-      file,
-      relative,
-      title: getPageTitle(contents, relative),
-      order: getPageOrder(contents),
-    };
-
-    if (!result.has(moduleName)) result.set(moduleName, []);
-    result.get(moduleName).push(page);
-  }
-
-  return result;
-}
-
-function addGeneratedNavFile (componentVersion, moduleName, navFile, navLines, templateFile) {
-  const navPath = `modules/${moduleName}/${navFile}`;
-  const origin = templateFile.src && templateFile.src.origin;
-  const cwd = templateFile.cwd || templateFile._cwd || process.cwd();
-  const base = templateFile.base || templateFile._base || cwd;
-  const absolutePath = origin && origin.worktree ? path.join(origin.worktree, navPath) : path.join(cwd, navPath);
-
-  const generatedFile = {
-    cwd,
-    base,
-    path: navPath,
-    contents: Buffer.from(`${navLines.join('\n')}\n`, 'utf8'),
-    src: {
-      abspath: absolutePath,
-      path: navPath,
-      basename: navFile,
-      stem: path.basename(navFile, '.adoc'),
-      extname: '.adoc',
-      origin,
-    },
-  };
-
-  removeExistingFile(componentVersion.files, navPath);
-  componentVersion.files.push(generatedFile);
-}
-
-function removeExistingFile (files, srcPath) {
-  const index = files.findIndex((file) => file.src && normalizeResourcePath(file.src.path) === srcPath);
-  if (index >= 0) files.splice(index, 1);
-}
-
-function buildTree (pages, maxLevels) {
-  const root = createDirectoryNode('', DEFAULT_ORDER);
-  for (const page of pages) addPageToTree(root, page, maxLevels);
-  updateDirectoryOrders(root);
-  return root;
-}
-
-function addPageToTree (root, page, maxLevels) {
-  const relativePath = normalizeResourcePath(page.relative);
-  const segments = relativePath.split('/').filter(Boolean);
-  if (segments.length === 0) return;
-
-  const fileStem = path.basename(segments[segments.length - 1], '.adoc');
-  const directorySegments = segments.slice(0, -1);
-  const isFolderIndexPage = directorySegments.length > 0 && fileStem === directorySegments[directorySegments.length - 1];
-  const maxDirectoryLevels = Math.max(maxLevels - 1, 0);
-  const visibleDirectorySegments = directorySegments.slice(0, maxDirectoryLevels);
-  const overflowDirectorySegments = directorySegments.slice(maxDirectoryLevels);
-
-  let current = root;
-
-  for (const directorySegment of visibleDirectorySegments) {
-    const key = `dir:${directorySegment}`;
-    if (!current.children.has(key)) {
-      current.children.set(key, createDirectoryNode(toDisplayTitle(directorySegment), DEFAULT_ORDER));
-    }
-    current = current.children.get(key);
-  }
-
-  if (isFolderIndexPage && overflowDirectorySegments.length === 0) {
-    current.page = { type: 'file', title: page.title, order: page.order, xref: relativePath };
-    current.title = page.title;
-    current.order = Math.min(current.order, page.order);
-    return;
-  }
-
-  const title = overflowDirectorySegments.length > 0
-    ? `${overflowDirectorySegments.map(toDisplayTitle).join(' / ')} / ${page.title}`
-    : page.title;
-
-  current.children.set(`file:${relativePath}`, {
-    type: 'file',
-    title,
-    order: page.order,
-    xref: relativePath,
-  });
-}
-
-function createDirectoryNode (title, order) {
-  return { type: 'directory', title, order, page: null, children: new Map() };
-}
-
-function updateDirectoryOrders (node) {
-  if (node.type !== 'directory') return node.order;
-
-  let lowestOrder = node.page ? node.page.order : DEFAULT_ORDER;
-  for (const child of node.children.values()) {
-    const childOrder = child.type === 'directory' ? updateDirectoryOrders(child) : child.order;
-    lowestOrder = Math.min(lowestOrder, childOrder);
-  }
-  node.order = lowestOrder;
-  return node.order;
-}
-
-function renderNav (node, level, maxLevels) {
-  const lines = [];
-  const children = Array.from(node.children.values()).sort(compareEntries);
-
-  for (const child of children) {
-    const safeLevel = Math.min(level, maxLevels);
-    const prefix = '*'.repeat(safeLevel);
-
-    if (child.type === 'directory') {
-      if (child.page) {
-        lines.push(`${prefix} xref:${child.page.xref}[${escapeLinkText(child.page.title)}]`);
-      } else {
-        lines.push(`${prefix} ${child.title}`);
-      }
-      lines.push(...renderNav(child, safeLevel + 1, maxLevels));
-    } else {
-      lines.push(`${prefix} xref:${child.xref}[${escapeLinkText(child.title)}]`);
-    }
-  }
-
-  return lines;
-}
-
-function addGitMetadata (contentCatalog, includeComponents) {
-  const historyCache = new Map();
-
-  for (const page of contentCatalog.getPages()) {
-    if (!isCatalogPageIncluded(page, includeComponents)) continue;
-
-    const origin = page.src && page.src.origin;
+    const origin = file.src && file.src.origin;
     const repository = resolveRepository(origin);
     if (!repository) continue;
 
@@ -208,20 +44,86 @@ function addGitMetadata (contentCatalog, includeComponents) {
       historyCache.set(cacheKey, loadRepositoryHistory(repository, reference));
     }
 
-    const repositoryPath = resolveRepositoryPath(page.src.path, origin && origin.startPath);
+    const repositoryPath = resolveRepositoryPath(file.src.path, origin && origin.startPath);
     const metadata = historyCache.get(cacheKey).get(repositoryPath);
     if (!metadata) continue;
 
-    page.src.lastModified = metadata.timestamp;
-    page.src.lastModifiedEpoch = metadata.epoch;
-    page.src.lastCommit = metadata.commit;
-
-    page.attributes = Object.assign({}, page.attributes, {
-      lastModified: metadata.timestamp,
-      lastModifiedEpoch: metadata.epoch,
-      lastCommit: metadata.commit,
+    const contents = setPageAttributes(getFileContents(file), {
+      'page-last-modified': metadata.timestamp,
+      'page-last-modified-epoch': metadata.epoch,
+      'page-last-commit': metadata.commit,
     });
+
+    setFileContents(file, contents);
   }
+}
+
+function generateNavigation (componentVersion, rules, navFile, maxLevels) {
+  const pagesByModule = new Map();
+
+  for (const file of componentVersion.files || []) {
+    const pageInfo = getPageInfo(file);
+    if (!pageInfo || !moduleMatches(componentVersion, pageInfo.module, rules)) continue;
+
+    const contents = getFileContents(file);
+    if (isNavExcluded(contents)) continue;
+
+    const page = {
+      file,
+      relative: pageInfo.relative,
+      title: getPageTitle(contents, pageInfo.relative),
+      order: getPageOrder(contents),
+    };
+
+    if (!pagesByModule.has(pageInfo.module)) pagesByModule.set(pageInfo.module, []);
+    pagesByModule.get(pageInfo.module).push(page);
+  }
+
+  for (const [moduleName, pages] of pagesByModule) {
+    if (pages.length === 0) continue;
+
+    const tree = createDirectoryNode('', DEFAULT_ORDER);
+    for (const page of pages) addPageToTree(tree, page, maxLevels);
+    updateDirectoryOrders(tree);
+
+    const navLines = renderNav(tree, 1, maxLevels);
+    if (navLines.length > 0) addGeneratedNavFile(componentVersion, moduleName, navFile, navLines, pages[0].file);
+  }
+}
+
+function getPageInfo (file) {
+  const sourcePath = normalizePath(file.src && file.src.path);
+  const match = sourcePath.match(/^modules\/([^/]+)\/pages\/(.+\.adoc)$/);
+  return match ? { module: match[1], relative: match[2] } : undefined;
+}
+
+function setPageAttributes (contents, attributes) {
+  let result = contents;
+
+  for (const [name, value] of Object.entries(attributes)) {
+    const line = `:${name}: ${value}`;
+    const pattern = new RegExp(`^:${escapeRegExp(name)}:[ \\t]*.*$`, 'm');
+
+    if (pattern.test(result)) result = result.replace(pattern, line);
+  }
+
+  const missingLines = Object.entries(attributes)
+    .filter(([name]) => !new RegExp(`^:${escapeRegExp(name)}:`, 'm').test(result))
+    .map(([name, value]) => `:${name}: ${value}`);
+
+  if (missingLines.length === 0) return result;
+
+  const titleMatch = result.match(/^(?:\uFEFF)?=\s+.+?(\r?\n)/);
+  if (!titleMatch) return `${missingLines.join('\n')}\n${result}`;
+
+  const position = titleMatch[0].length;
+  return `${result.slice(0, position)}${missingLines.join('\n')}\n${result.slice(position)}`;
+}
+
+function setFileContents (file, contents) {
+  const buffer = Buffer.from(contents, 'utf8');
+  if (Object.prototype.hasOwnProperty.call(file, '_contents')) file._contents = buffer;
+  else file.contents = buffer;
 }
 
 function resolveRepository (origin) {
@@ -236,9 +138,9 @@ function resolveGitReference (origin) {
 }
 
 function resolveRepositoryPath (sourcePath, startPath) {
-  const normalizedSourcePath = normalizeResourcePath(sourcePath).replace(/^\/+/, '');
-  const normalizedStartPath = normalizeResourcePath(startPath).replace(/^\/+|\/+$/g, '');
-  return normalizedStartPath ? `${normalizedStartPath}/${normalizedSourcePath}` : normalizedSourcePath;
+  const source = normalizePath(sourcePath).replace(/^\/+/, '');
+  const start = normalizePath(startPath).replace(/^\/+|\/+$/g, '');
+  return start ? `${start}/${source}` : source;
 }
 
 function loadRepositoryHistory (repository, reference) {
@@ -269,11 +171,8 @@ function parseGitHistory (output) {
     if (line.startsWith('COMMIT\t')) {
       const [, commit, timestamp, epoch] = line.split('\t');
       current = { commit, timestamp, epoch: Number(epoch) };
-      continue;
-    }
-
-    if (current) {
-      const filePath = normalizeResourcePath(line);
+    } else if (current) {
+      const filePath = normalizePath(line);
       if (!history.has(filePath)) history.set(filePath, current);
     }
   }
@@ -281,116 +180,169 @@ function parseGitHistory (output) {
   return history;
 }
 
-function isCatalogPageIncluded (page, includeComponents) {
-  if (!includeComponents) return true;
-  return includeComponents.some((entry) => {
-    if (entry.name !== page.src.component) return false;
-    if (entry.versions && !entry.versions.has(page.src.version)) return false;
-    if (entry.modules && !entry.modules.has(page.src.module)) return false;
-    return true;
+function addPageToTree (root, page, maxLevels) {
+  const segments = normalizePath(page.relative).split('/').filter(Boolean);
+  if (segments.length === 0) return;
+
+  const fileStem = path.basename(segments.at(-1), '.adoc');
+  const directories = segments.slice(0, -1);
+  const isFolderIndex = directories.length > 0 && fileStem === directories.at(-1);
+  const visibleDirectories = directories.slice(0, Math.max(maxLevels - 1, 0));
+  const overflowDirectories = directories.slice(Math.max(maxLevels - 1, 0));
+
+  let current = root;
+  for (const directory of visibleDirectories) {
+    const key = `dir:${directory}`;
+    if (!current.children.has(key)) current.children.set(key, createDirectoryNode(toDisplayTitle(directory), DEFAULT_ORDER));
+    current = current.children.get(key);
+  }
+
+  if (isFolderIndex && overflowDirectories.length === 0) {
+    current.page = { title: page.title, order: page.order, xref: page.relative };
+    current.title = page.title;
+    return;
+  }
+
+  const title = overflowDirectories.length
+    ? `${overflowDirectories.map(toDisplayTitle).join(' / ')} / ${page.title}`
+    : page.title;
+
+  current.children.set(`file:${page.relative}`, {
+    type: 'file', title, order: page.order, xref: page.relative,
   });
 }
 
-function getPageTitle (contents, relativePath) {
+function createDirectoryNode (title, order) {
+  return { type: 'directory', title, order, page: null, children: new Map() };
+}
+
+function updateDirectoryOrders (node) {
+  let lowest = node.page ? node.page.order : DEFAULT_ORDER;
+  for (const child of node.children.values()) {
+    const order = child.type === 'directory' ? updateDirectoryOrders(child) : child.order;
+    lowest = Math.min(lowest, order);
+  }
+  node.order = lowest;
+  return lowest;
+}
+
+function renderNav (node, level, maxLevels) {
+  const lines = [];
+  const children = [...node.children.values()].sort(compareEntries);
+
+  for (const child of children) {
+    const currentLevel = Math.min(level, maxLevels);
+    const prefix = '*'.repeat(currentLevel);
+
+    if (child.type === 'directory') {
+      lines.push(child.page
+        ? `${prefix} xref:${child.page.xref}[${escapeLinkText(child.page.title)}]`
+        : `${prefix} ${child.title}`);
+      lines.push(...renderNav(child, currentLevel + 1, maxLevels));
+    } else {
+      lines.push(`${prefix} xref:${child.xref}[${escapeLinkText(child.title)}]`);
+    }
+  }
+
+  return lines;
+}
+
+function addGeneratedNavFile (componentVersion, moduleName, navFile, navLines, templateFile) {
+  const navPath = `modules/${moduleName}/${navFile}`;
+  const origin = templateFile.src && templateFile.src.origin;
+  const cwd = templateFile.cwd || templateFile._cwd || process.cwd();
+  const existingIndex = componentVersion.files.findIndex((file) => file.src && normalizePath(file.src.path) === navPath);
+  if (existingIndex >= 0) componentVersion.files.splice(existingIndex, 1);
+
+  componentVersion.files.push({
+    cwd,
+    base: templateFile.base || templateFile._base || cwd,
+    path: navPath,
+    contents: Buffer.from(`${navLines.join('\n')}\n`, 'utf8'),
+    src: {
+      abspath: origin && origin.worktree ? path.join(origin.worktree, navPath) : path.join(cwd, navPath),
+      path: navPath,
+      basename: navFile,
+      stem: path.basename(navFile, '.adoc'),
+      extname: '.adoc',
+      origin,
+    },
+  });
+}
+
+function getPageTitle (contents, relative) {
   return firstNonBlank([
     getAttribute(contents, 'page-nav-title'),
     getAttribute(contents, 'navtitle'),
     getAttribute(contents, 'page-title'),
-    getDocumentTitle(contents),
-    toDisplayTitle(path.basename(relativePath, '.adoc')),
+    (contents.match(/^=\s+(.+?)\s*$/m) || [])[1],
+    toDisplayTitle(path.basename(relative, '.adoc')),
   ]);
 }
 
 function getPageOrder (contents) {
-  const parsed = Number(getAttribute(contents, 'nav-order'));
-  return Number.isFinite(parsed) ? parsed : DEFAULT_ORDER;
+  const value = Number(getAttribute(contents, 'nav-order'));
+  return Number.isFinite(value) ? value : DEFAULT_ORDER;
 }
 
 function isNavExcluded (contents) {
   const value = getAttribute(contents, 'nav-exclude');
-  if (value === undefined || value === null || value === false) return false;
-  const normalized = String(value).trim().toLowerCase();
-  return normalized === '' || normalized === 'true' || normalized === 'yes' || normalized === '1';
+  if (value === undefined) return false;
+  return ['', 'true', 'yes', '1'].includes(String(value).trim().toLowerCase());
 }
 
 function getAttribute (contents, name) {
-  const match = contents.match(new RegExp(`^:${escapeRegExp(name)}:[ \t]*(.*?)[ \t]*$`, 'm'));
+  const match = contents.match(new RegExp(`^:${escapeRegExp(name)}:[ \\t]*(.*?)[ \\t]*$`, 'm'));
   return match ? match[1] : undefined;
-}
-
-function getDocumentTitle (contents) {
-  const match = contents.match(/^=\s+(.+?)\s*$/m);
-  return match ? match[1].trim() : undefined;
 }
 
 function getFileContents (file) {
   const contents = file.contents || file._contents;
-  if (!contents) return '';
-  return Buffer.isBuffer(contents) ? contents.toString('utf8') : String(contents);
+  return Buffer.isBuffer(contents) ? contents.toString('utf8') : String(contents || '');
 }
 
-function compareEntries (a, b) {
-  if (a.order !== b.order) return a.order - b.order;
-  if (a.type !== b.type) return a.type === 'file' ? -1 : 1;
-  return a.title.localeCompare(b.title, 'de', { numeric: true, sensitivity: 'base' });
+function normalizeComponentRules (components) {
+  if (!components) return null;
+  if (!Array.isArray(components)) throw new Error('components must be an array');
+  return components.map((entry) => typeof entry === 'string'
+    ? { name: entry, versions: null, modules: null }
+    : { name: entry.name, versions: toSet(entry.versions), modules: toSet(entry.modules) });
+}
+
+function componentMatches (componentVersion, rules) {
+  return !rules || rules.some((rule) => rule.name === componentVersion.name && (!rule.versions || rule.versions.has(componentVersion.version)));
+}
+
+function moduleMatches (componentVersion, moduleName, rules) {
+  return !rules || rules.some((rule) => rule.name === componentVersion.name &&
+    (!rule.versions || rule.versions.has(componentVersion.version)) &&
+    (!rule.modules || rule.modules.has(moduleName)));
+}
+
+function toSet (value) {
+  return value ? new Set(Array.isArray(value) ? value : [value]) : null;
 }
 
 function normalizeMaxLevels (value) {
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_MAX_LEVELS;
-  return Math.min(parsed, DEFAULT_MAX_LEVELS);
+  return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, MAX_LEVELS) : MAX_LEVELS;
 }
 
-function toMatcherConfig (components) {
-  if (!components) return null;
-  if (!Array.isArray(components)) throw new Error('generated navigation extension: components must be an array');
-
-  return components.map((entry) => {
-    if (typeof entry === 'string') return { name: entry, versions: null, modules: null };
-    if (!entry || typeof entry !== 'object' || !entry.name) {
-      throw new Error('generated navigation extension: each component entry must be a string or an object with a name');
-    }
-    return { name: entry.name, versions: toSet(entry.versions), modules: toSet(entry.modules) };
-  });
-}
-
-function toSet (value) {
-  if (!value) return null;
-  return new Set(Array.isArray(value) ? value : [value]);
-}
-
-function isComponentVersionIncluded (componentVersion, includeComponents) {
-  if (!includeComponents) return true;
-  return includeComponents.some((entry) => {
-    if (entry.name !== componentVersion.name) return false;
-    if (entry.versions && !entry.versions.has(componentVersion.version)) return false;
-    return true;
-  });
-}
-
-function isModuleIncluded (componentVersion, moduleName, includeComponents) {
-  if (!includeComponents) return true;
-  return includeComponents.some((entry) => {
-    if (entry.name !== componentVersion.name) return false;
-    if (entry.versions && !entry.versions.has(componentVersion.version)) return false;
-    if (entry.modules && !entry.modules.has(moduleName)) return false;
-    return true;
-  });
+function compareEntries (a, b) {
+  return a.order !== b.order ? a.order - b.order : a.title.localeCompare(b.title, 'de', { numeric: true, sensitivity: 'base' });
 }
 
 function firstNonBlank (values) {
-  for (const value of values) {
-    if (value !== undefined && value !== null && String(value).trim() !== '') return String(value).trim();
-  }
-  return '';
+  const value = values.find((entry) => entry !== undefined && entry !== null && String(entry).trim());
+  return value === undefined ? '' : String(value).trim();
 }
 
-function normalizeResourcePath (value) {
+function normalizePath (value) {
   return String(value || '').split(path.sep).join('/');
 }
 
 function toDisplayTitle (value) {
-  return String(value).replace(/\.adoc$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  return String(value).replace(/\.adoc$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
 function escapeLinkText (value) {
